@@ -347,40 +347,97 @@ Compares against FLA baseline (`fla.ops.gated_delta_rule.chunk`). Supports sweep
 
 ---
 
-## Proof-of-Learning Patch
+## Proof-of-Learning Patch (Mergeable Options)
 
-**End goal:** Write a patch (on this branch) that demonstrates deep understanding of the Blackwell GDN kernel. Candidate patches (pick one or combine):
+**End goal:** A patch that (a) proves deep understanding of the Blackwell GDN kernel and (b) is genuinely useful to the repo and will be approved upstream.
 
-### Option A: Add SM90 (Hopper) GDN Prefill via CuTe-DSL
-Port the Blackwell CuTe-DSL kernel back to Hopper (SM90), replacing the existing Triton/CUDA path. This would require:
-- Replacing tcgen05 UMMA with wgmma (SM90 MMA)
-- Replacing TMEM usage with register-based accumulators
-- Adjusting pipeline stages for SM90's TMA capabilities
+### Option A: Blackwell-Optimized GDN Decode with F32x2 Packed FMA (BEST FIT)
+**Why it merges:** The existing decode kernels (`gdn_decode_bf16_state.py`) explicitly note
+"Can be optimized with packed F32x2 FMA for SM100+ in future releases" (line 37).
+Currently they use scalar FMA that works on SM90+, but Blackwell has native `fma_packed_f32x2`
+which doubles throughput for the state update. No one has done this yet.
 
-### Option B: Add head_dim=64 or head_dim=256 Support
-The current kernel only supports head_dim=128. Extend it to 64 or 256 by:
-- Adjusting tile sizes and MMA tilers
-- Updating TMEM column partitioning
-- Modifying the matrix inversion block sizes
-- Adding tests for the new head_dim
+**What you'd do:**
+- Add a Blackwell-specific decode kernel path using `cute.arch.fma_packed_f32x2()`
+- The scalar FMA helpers (`mul_f32`, `fma_f32` at lines 131-160) become packed equivalents
+- Add SM100/110 dispatch in `gdn_decode.py` (same pattern as the prefill dispatch you studied)
+- Benchmark: should see ~1.5-2x speedup on decode state update
+- Tests: existing decode tests + SM100 skip logic
 
-### Option C: Optimize the Matrix Inversion
-Profile the kernel and identify if the 2-level block inversion is the bottleneck. If so:
-- Explore 3-level inversion for larger chunk sizes
-- Or optimize the existing 2-level by overlapping L0 and L1 stages better
-- Benchmark before/after
+**Proves understanding of:** warp-level compute patterns, state update math, Blackwell ISA features,
+dispatch architecture. Directly analogous to the prefill change you're studying.
 
-### Option D: Write a Standalone Annotated Mini-Kernel
-Write a simplified (~500 line) CuTe-DSL kernel that implements chunked GDN for a single head, fixed batch=1, no GVA, demonstrating:
-- The core chunked delta rule math
-- Warp specialization pattern
-- TMA + pipeline usage on Blackwell
-- Matrix inversion for intra-chunk correction
+**Difficulty:** Medium. The decode kernel is ~2000 lines (vs 4700 for prefill), simpler structure
+(no matrix inversion, no warp specialization), and you have a clear before/after to benchmark.
 
-This proves you understand the algorithm AND the Blackwell programming model without the complexity of the full production kernel.
+### Option B: Fix SMEM Bank Conflicts in Blackwell Prefill Matrix Inversion
+**Why it merges:** There are 4 explicit `# todo: remove smem bank conflict` comments in the
+matrix inversion code (lines 2740, 2757, 2845, 2865 of `gdn.py`). These are in the
+`store_ivt_smem_l0_ss_b` and `store_ivt_smem_l1_ss_b` methods -- the hot path of the
+2-level block inversion.
 
-### Option E: Add Detailed Inline Annotations
-Fork the kernel code and add comprehensive inline comments mapping each code section to the mathematical equations, explaining TMEM allocation decisions, pipeline stage choices, and warp specialization tradeoffs. Submit as a "documented" version.
+**What you'd do:**
+- Profile the kernel with Nsight Compute to quantify bank conflict overhead
+- Redesign the SMEM layout for the inversion sub-tiles to avoid conflicts
+  (likely need swizzled addressing or padding, similar to `gdn_decode_mtp.py:1720`
+  which uses `stride = K + 4` to avoid bank conflicts)
+- Benchmark before/after on the full prefill kernel
+- The fix touches a small, self-contained part of the kernel
+
+**Proves understanding of:** SMEM bank conflict mechanics, the matrix inversion data flow,
+TMEM-to-SMEM copy patterns, and profiling methodology.
+
+**Difficulty:** Medium-Hard. Requires Nsight Compute profiling on a Blackwell GPU and
+understanding the exact access patterns in the inversion loop.
+
+### Option C: Add bf16/fp16 State Support for Blackwell Prefill
+**Why it merges:** The kernel header explicitly states "State input and output are in f32
+(fp16/bf16 not supported yet)" (line 31 of `gdn.py`). The decode kernel already has a
+`bf16_state` variant that's widely used. Reducing state from f32 to bf16 halves state
+memory bandwidth -- critical for long sequences with many heads.
+
+**What you'd do:**
+- Add a bf16 accumulation path for the state tensor in `__call__` and `kernel`
+- The state TMA loads/stores need new copy atoms for bf16
+- The state update MMA (`update_s_tiled_mma`) accumulates in f32 but reads/writes bf16 state
+- Add `state_dtype` parameter to `chunk_gated_delta_rule` API
+- Tests: verify numerical accuracy vs f32 state (will need looser tolerances)
+
+**Proves understanding of:** state lifecycle (init -> gate -> update -> store), TMA descriptor
+setup, mixed-precision accumulation, the full host-to-device data flow.
+
+**Difficulty:** Hard. Touches many parts of the kernel (TMA descriptors, SMEM layouts,
+accumulator handling) but is a clear feature gap.
+
+### Option D: Add Blackwell GDN Prefill to AOT Compilation + Benchmark Suite
+**Why it merges:** The new kernel has no entry in `flashinfer/aot.py` (needed for
+pre-compiled packages) and the benchmark isn't integrated into the unified
+`benchmarks/flashinfer_benchmark.py` framework. These are table-stakes for landing a new kernel.
+
+**What you'd do:**
+- Register the Blackwell GDN prefill in `flashinfer/aot.py` for pre-compiled packages
+- Integrate `bench_blackwell_gdn_prefill.py` into the unified benchmark framework
+- Add the kernel to `flashinfer/__init__.py` exports properly for Blackwell
+- Ensure `@flashinfer_api` logging works on the new dispatch path
+- Add proper `@register_fake_op` for `torch.compile` compatibility on the Blackwell path
+
+**Proves understanding of:** the full FlashInfer infrastructure (JIT, AOT, benchmarking,
+torch.compile integration), and the dispatch/compilation flow of the new kernel.
+
+**Difficulty:** Medium-Low. More infrastructure than kernel work, but requires understanding
+how the kernel fits into the broader system.
+
+### Recommendation
+
+**Start with Option A (F32x2 decode)** if you want the clearest "I understood the GDN math and
+Blackwell ISA" signal with a high chance of merging. It's the most explicitly requested
+optimization in the codebase.
+
+**Do Option B (bank conflicts)** if you want to go deep on the prefill kernel specifically
+and have Blackwell GPU access for profiling.
+
+**Do Option D (AOT + benchmarks)** as a complementary patch alongside A or B -- it's
+lower risk and fills a real gap.
 
 ---
 
